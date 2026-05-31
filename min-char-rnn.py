@@ -269,3 +269,17 @@ sampled_indices = sample(previous_hidden_state, char_to_index[text[0]], 200)
 sampled_text = ''.join(index_to_char[i] for i in sampled_indices)
 print('----\n %s \n----' % (sampled_text,))
 print('iter %d, loss: %f (done)' % (iteration, smooth_loss))
+
+# Save trained parameters and vocab so we can inspect/visualize the model later.
+np.savez(
+    'model.npz',
+    weights_input_to_hidden=weights_input_to_hidden,
+    weights_hidden_to_hidden=weights_hidden_to_hidden,
+    weights_hidden_to_output=weights_hidden_to_output,
+    bias_hidden=bias_hidden,
+    bias_output=bias_output,
+    chars=np.array(unique_chars),
+    hidden_size=np.array(hidden_size),
+    vocab_size=np.array(vocab_size),
+)
+print('saved trained model to model.npz')
