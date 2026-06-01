@@ -218,6 +218,9 @@ mem_bias_output = np.zeros_like(bias_output)
 # We track an exponential moving average so the printed loss isn't noisy window-to-window.
 smooth_loss = -np.log(1.0 / vocab_size) * sequence_length
 max_iterations = args.steps
+loss_iterations = []
+loss_smooth = []
+loss_window = []
 
 while iteration < max_iterations:
   # Step the data pointer through the corpus in chunks of `sequence_length`.
@@ -232,9 +235,9 @@ while iteration < max_iterations:
   input_indices  = [char_to_index[char] for char in text[data_pointer    : data_pointer + sequence_length    ]]
   target_indices = [char_to_index[char] for char in text[data_pointer + 1: data_pointer + sequence_length + 1]]
 
-  # Every 100 iterations, draw a 200-char sample from the model to see what it's learning.
+  # Every 100 iterations, draw a short sample from the model to see what it's learning.
   if iteration % 100 == 0:
-    sampled_indices = sample(previous_hidden_state, input_indices[0], 200)
+    sampled_indices = sample(previous_hidden_state, input_indices[0], 50)
     sampled_text = ''.join(index_to_char[i] for i in sampled_indices)
     print('----\n %s \n----' % (sampled_text,))
 
@@ -247,6 +250,9 @@ while iteration < max_iterations:
 
   # Exponential moving average of the loss for smoother printing.
   smooth_loss = smooth_loss * 0.999 + loss * 0.001
+  loss_iterations.append(iteration)
+  loss_smooth.append(smooth_loss)
+  loss_window.append(loss)
   if iteration % 100 == 0:
     print('iter %d, loss: %f' % (iteration, smooth_loss))
 
@@ -265,7 +271,7 @@ while iteration < max_iterations:
   iteration    += 1
 
 # Final sample after training finishes, plus the last smoothed loss.
-sampled_indices = sample(previous_hidden_state, char_to_index[text[0]], 200)
+sampled_indices = sample(previous_hidden_state, char_to_index[text[0]], 50)
 sampled_text = ''.join(index_to_char[i] for i in sampled_indices)
 print('----\n %s \n----' % (sampled_text,))
 print('iter %d, loss: %f (done)' % (iteration, smooth_loss))
@@ -281,5 +287,8 @@ np.savez(
     chars=np.array(unique_chars),
     hidden_size=np.array(hidden_size),
     vocab_size=np.array(vocab_size),
+    loss_iterations=np.array(loss_iterations, dtype=np.int32),
+    loss_smooth=np.array(loss_smooth, dtype=np.float64),
+    loss_window=np.array(loss_window, dtype=np.float64),
 )
 print('saved trained model to model.npz')

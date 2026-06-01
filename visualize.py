@@ -21,28 +21,44 @@ Loads the saved model from `model.npz`, runs a forward pass over the first
   4) hidden_states_by_target.png    (only when hidden_size == 2)
        Same scatter, colored by the *next* (target) character.
 
-  5) hidden_states_pca_context_labels.png
-       2D PCA projection of hidden states. Each state is shown as a text
-       annotation containing the two preceding characters, colored by the
-       current input character.
+  5) learning_curve.png
+       Per-window training loss vs iteration (from model.npz).
+
+  6) hidden_states_pca_context_labels.png
+       2D PCA of hidden states; annotation = prev2 + current char.
+
+  7) hidden_states_mds_context_labels.png
+       2D MDS from the same euclidean distances as the clustermap dendrogram.
+
+  8) hidden_states_clustermap.png
+       Heatmap of timesteps × hidden units with row/column dendrograms
+       (average linkage). Row labels: two preceding chars + current char.
+
+  9) weights.png
+       Side-by-side heatmaps of final input weights (char columns × hidden rows)
+       and recurrent hidden→hidden weights (h0..h{n-1} in index order).
 
 Usage:
-    python visualize.py                  # default: 200 chars
-    python visualize.py --length 60
-    python visualize.py --length 200 --out-dir plots
+    python visualize.py                  # default: 50 chars
+    python visualize.py --length 80
+    python visualize.py --length 50 --out-dir plots
 """
 
 from __future__ import annotations
 
 import argparse
 import os
+from collections import defaultdict
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
+import seaborn as sns
+from scipy.spatial.distance import pdist, squareform
 
 
 def load_model(path: str = "model.npz"):
     data = np.load(path, allow_pickle=False)
-    return {
+    model = {
         "weights_input_to_hidden":  data["weights_input_to_hidden"],
         "weights_hidden_to_hidden": data["weights_hidden_to_hidden"],
         "weights_hidden_to_output": data["weights_hidden_to_output"],
@@ -52,6 +68,11 @@ def load_model(path: str = "model.npz"):
         "hidden_size":              int(data["hidden_size"]),
         "vocab_size":               int(data["vocab_size"]),
     }
+    if "loss_iterations" in data.files:
+        model["loss_iterations"] = data["loss_iterations"]
+        model["loss_smooth"] = data["loss_smooth"]
+        model["loss_window"] = data["loss_window"]
+    return model
 
 
 def forward_pass(model, text: str):
@@ -163,14 +184,25 @@ def plot_hidden_states_heatmap(text, hidden_states, save_path):
     print(f"wrote {save_path}")
 
 
-def average_linkage_cluster_order(rows):
-    """Return row indices ordered by a small average-linkage clustering pass."""
+def average_linkage_hierarchy(rows):
+    """Average-linkage clustering; returns (linkage, leaf_order).
+
+    linkage has shape (n-1, 4) with columns [left_id, right_id, distance, count]
+    in the same convention as scipy.cluster.hierarchy.linkage.
+    """
     n_rows = rows.shape[0]
-    if n_rows <= 2:
-        return list(range(n_rows))
+    if n_rows == 0:
+        return np.zeros((0, 4)), []
+    if n_rows == 1:
+        return np.zeros((0, 4)), [0]
 
     distances = np.linalg.norm(rows[:, None, :] - rows[None, :, :], axis=2)
-    clusters = [{"indices": [i], "members": [i]} for i in range(n_rows)]
+    clusters = [
+        {"indices": [i], "members": [i], "cluster_id": i, "size": 1}
+        for i in range(n_rows)
+    ]
+    linkage = []
+    next_cluster_id = n_rows
 
     while len(clusters) > 1:
         best_pair = None
@@ -188,15 +220,30 @@ def average_linkage_cluster_order(rows):
                     best_pair = (i, j)
 
         left, right = best_pair
+        left_cluster, right_cluster = clusters[left], clusters[right]
+        linkage.append([
+            left_cluster["cluster_id"],
+            right_cluster["cluster_id"],
+            best_distance,
+            left_cluster["size"] + right_cluster["size"],
+        ])
         merged = {
-            "indices": clusters[left]["indices"] + clusters[right]["indices"],
-            "members": clusters[left]["members"] + clusters[right]["members"],
+            "indices": left_cluster["indices"] + right_cluster["indices"],
+            "members": left_cluster["members"] + right_cluster["members"],
+            "cluster_id": next_cluster_id,
+            "size": left_cluster["size"] + right_cluster["size"],
         }
-
+        next_cluster_id += 1
         clusters[left] = merged
         del clusters[right]
 
-    return clusters[0]["indices"]
+    return np.array(linkage), clusters[0]["indices"]
+
+
+def average_linkage_cluster_order(rows):
+    """Return row indices ordered by a small average-linkage clustering pass."""
+    _, order = average_linkage_hierarchy(rows)
+    return order
 
 
 def display_char(char):
@@ -220,12 +267,174 @@ def previous_two_label(text, index):
     return "".join(display_char(char) for char in text[index - 2:index])
 
 
+def timestep_context_label(text, index):
+    """Two preceding characters plus the current input character."""
+    if index < 0:
+        return ""
+    if index == 0:
+        return f"^{display_char(text[0])}"
+    if index == 1:
+        return f"{display_char(text[0])}{display_char(text[1])}"
+    return previous_two_label(text, index) + display_char(text[index])
+
+
+def plot_hidden_states_clustermap(text, hidden_states, save_path):
+    """Heatmap (timesteps × hidden units) with seaborn clustermap layout."""
+    n_rows, n_cols = hidden_states.shape
+    if n_rows == 0:
+        return
+
+    row_labels = [timestep_context_label(text, t) for t in range(n_rows)]
+    col_labels = [f"h{i}" for i in range(n_cols)]
+    data = pd.DataFrame(hidden_states, index=row_labels, columns=col_labels)
+
+    grid = sns.clustermap(
+        data,
+        method="average",
+        metric="euclidean",
+        cmap="RdBu_r",
+        vmin=-1,
+        vmax=1,
+        center=0,
+        figsize=(max(9, n_cols * 0.55), max(6, n_rows * 0.25)),
+        dendrogram_ratio=(0.12, 0.1),
+        cbar=False,
+        xticklabels=True,
+        yticklabels=True,
+    )
+    grid.ax_heatmap.set_xlabel("hidden unit")
+    grid.ax_heatmap.set_ylabel("timestep (prev2 + current)")
+    grid.ax_heatmap.tick_params(axis="y", labelsize=7)
+    grid.ax_heatmap.tick_params(axis="x", labelsize=8)
+    grid.fig.suptitle("Hidden states clustered (timesteps × units)", y=1.02, fontsize=11)
+    grid.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close(grid.fig)
+    print(f"wrote {save_path}")
+
+
 def pca_2d(points):
     """Project points to two dimensions with PCA using NumPy's SVD."""
     centered = points - np.mean(points, axis=0, keepdims=True)
     _, _, vh = np.linalg.svd(centered, full_matrices=False)
     components = vh[:2].T
     return centered @ components
+
+
+def mds_2d(points):
+    """Classical MDS on euclidean distances (same metric as clustermap)."""
+    n = points.shape[0]
+    if n < 2:
+        return np.zeros((n, 2))
+
+    distances = squareform(pdist(points, metric="euclidean"))
+    centering = np.eye(n) - np.ones((n, n)) / n
+    gram = -0.5 * centering @ (distances ** 2) @ centering
+    eigenvalues, eigenvectors = np.linalg.eigh(gram)
+    order = np.argsort(eigenvalues)[::-1]
+    eigenvalues = np.maximum(eigenvalues[order[:2]], 0.0)
+    basis = eigenvectors[:, order[:2]]
+    return basis * np.sqrt(eigenvalues)
+
+
+def plot_learning_curve(model, save_path):
+    """Plot per-window training loss recorded during training."""
+    if "loss_iterations" not in model:
+        print(f"skip {save_path}: re-run min-char-rnn.py to record loss history")
+        return
+
+    iters = model["loss_iterations"]
+    window = model["loss_window"]
+
+    fig, ax = plt.subplots(figsize=(9, 4), constrained_layout=True)
+    ax.plot(iters, window, color="steelblue", linewidth=1.0)
+    ax.set_xlabel("iteration")
+    ax.set_ylabel("cross-entropy (sum over BPTT window)")
+    ax.set_title("Training loss")
+    ax.grid(True, linestyle=":", alpha=0.4)
+    fig.savefig(save_path, dpi=150)
+    plt.close(fig)
+    print(f"wrote {save_path}")
+
+
+def plot_2d_hidden_state_labels(text, hidden_states, chars, projected, save_path, title, xlabel, ylabel):
+    """Scatter points with one prev2+current label per sequence, lines to its points."""
+    _ = chars
+    if len(text) == 0:
+        return
+
+    labels = [timestep_context_label(text, i) for i in range(len(text))]
+    unique_labels = sorted(set(labels))
+    cmap = plt.get_cmap("tab20" if len(unique_labels) <= 20 else "hsv")
+    sequence_color = {
+        label: cmap(i / max(len(unique_labels) - 1, 1))
+        for i, label in enumerate(unique_labels)
+    }
+
+    fig, ax = plt.subplots(figsize=(14, 11), constrained_layout=True)
+
+    by_sequence = defaultdict(list)
+    for i, label in enumerate(labels):
+        by_sequence[label].append(i)
+
+    center = projected.mean(axis=0)
+    span = max(
+        float(np.ptp(projected[:, 0])),
+        float(np.ptp(projected[:, 1])),
+        1e-3,
+    )
+    label_offset = span * 0.14
+    text_positions = []
+
+    for label, indices in by_sequence.items():
+        color = sequence_color[label]
+        points = projected[indices]
+        ax.scatter(
+            points[:, 0], points[:, 1],
+            s=36, color=color, edgecolors="black", linewidths=0.35,
+            alpha=0.8, zorder=3,
+        )
+
+        centroid = points.mean(axis=0)
+        outward = centroid - center
+        norm = float(np.linalg.norm(outward))
+        if norm < 1e-9:
+            outward = np.array([0.0, 1.0])
+        else:
+            outward = outward / norm
+        text_pos = centroid + outward * label_offset
+        text_positions.append(text_pos)
+
+        for point in points:
+            ax.plot(
+                [text_pos[0], point[0]], [text_pos[1], point[1]],
+                color=color, alpha=0.5, linewidth=0.9, zorder=1,
+            )
+        ax.text(
+            text_pos[0], text_pos[1], label,
+            fontsize=10, color=color, ha="center", va="center",
+            bbox=dict(
+                boxstyle="round,pad=0.25", facecolor="white",
+                edgecolor=color, alpha=0.9, linewidth=0.8,
+            ),
+            zorder=4,
+        )
+
+    all_x = np.concatenate([projected[:, 0], [p[0] for p in text_positions]])
+    all_y = np.concatenate([projected[:, 1], [p[1] for p in text_positions]])
+    x_pad = max((all_x.max() - all_x.min()) * 0.1, 1e-3)
+    y_pad = max((all_y.max() - all_y.min()) * 0.1, 1e-3)
+    ax.set_xlim(all_x.min() - x_pad, all_x.max() + x_pad)
+    ax.set_ylim(all_y.min() - y_pad, all_y.max() + y_pad)
+
+    ax.axhline(0, color="lightgrey", linewidth=0.6, zorder=0)
+    ax.axvline(0, color="lightgrey", linewidth=0.6, zorder=0)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.grid(True, linestyle=":", alpha=0.35)
+    fig.savefig(save_path, dpi=300)
+    plt.close(fig)
+    print(f"wrote {save_path}")
 
 
 def plot_per_char_hidden_state_heatmaps(text, hidden_states, chars, save_path, cluster_rows=True):
@@ -291,54 +500,85 @@ def plot_per_char_hidden_state_heatmaps(text, hidden_states, chars, save_path, c
 
 
 def plot_pca_context_labels(text, hidden_states, chars, save_path):
-    """2D PCA of hidden states annotated by the two characters before each state."""
-    if len(text) < 3:
+    """2D PCA of hidden states; labels show prev2 + current char."""
+    if len(text) < 1:
         return
-
-    indices = np.arange(2, len(text))
-    projected = pca_2d(hidden_states[indices])
-    current_chars = [text[int(i)] for i in indices]
-    labels = [previous_two_label(text, int(i)) for i in indices]
-    cmap = plt.get_cmap("tab10")
-    char_to_color = {c: cmap(i % 10) for i, c in enumerate(chars)}
-
-    fig, ax = plt.subplots(figsize=(14, 11), constrained_layout=True)
-    ax.scatter(projected[:, 0], projected[:, 1], s=1, alpha=0)
-
-    for (x, y), label, char in zip(projected, labels, current_chars):
-        ax.annotate(
-            label,
-            (x, y),
-            color=char_to_color[char],
-            fontsize=11,
-            ha="center",
-            va="center",
-            alpha=0.85,
-        )
-
-    x_min, x_max = np.min(projected[:, 0]), np.max(projected[:, 0])
-    y_min, y_max = np.min(projected[:, 1]), np.max(projected[:, 1])
-    x_pad = max((x_max - x_min) * 0.08, 1e-3)
-    y_pad = max((y_max - y_min) * 0.08, 1e-3)
-    ax.set_xlim(x_min - x_pad, x_max + x_pad)
-    ax.set_ylim(y_min - y_pad, y_max + y_pad)
-
-    handles = [
-        plt.Line2D([0], [0], marker="o", linestyle="", color=char_to_color[c], label=repr(c))
-        for c in chars
-        if c in current_chars
-    ]
-    ax.legend(handles=handles, title="current char", loc="best", framealpha=0.9)
-    ax.axhline(0, color="lightgrey", linewidth=0.6, zorder=0)
-    ax.axvline(0, color="lightgrey", linewidth=0.6, zorder=0)
-    ax.set_xlabel("PC1")
-    ax.set_ylabel("PC2")
-    ax.set_title(
-        "2D PCA of hidden states "
-        "(annotation = previous two chars, color = current char)"
+    plot_2d_hidden_state_labels(
+        text, hidden_states, chars,
+        pca_2d(hidden_states),
+        save_path,
+        title="2D PCA (color + label = prev2+current trigram)",
+        xlabel="PC1",
+        ylabel="PC2",
     )
-    ax.grid(True, linestyle=":", alpha=0.35)
-    fig.savefig(save_path, dpi=300)
+
+
+def plot_mds_context_labels(text, hidden_states, chars, save_path):
+    """2D MDS from euclidean distances (same metric as hierarchical clustermap)."""
+    if len(text) < 2:
+        return
+    plot_2d_hidden_state_labels(
+        text, hidden_states, chars,
+        mds_2d(hidden_states),
+        save_path,
+        title="2D MDS (color + label = prev2+current trigram)",
+        xlabel="MDS 1",
+        ylabel="MDS 2",
+    )
+
+
+def char_axis_labels(chars):
+    """Tick labels for the vocabulary axis (readable for whitespace)."""
+    return [display_char(c) for c in chars]
+
+
+def symmetric_abs_vmax(*matrices):
+    return float(max(np.max(np.abs(m)) for m in matrices))
+
+
+def plot_learned_weights(model, out_dir):
+    """Side-by-side Wxh and Whh heatmaps; hidden units in index order h0..h{n-1}."""
+    W_in = np.asarray(model["weights_input_to_hidden"])
+    W_rec = np.asarray(model["weights_hidden_to_hidden"])
+    chars = model["chars"]
+    hidden_size, vocab_size = W_in.shape
+    vmax = symmetric_abs_vmax(W_in, W_rec)
+    unit_labels = [f"h{i}" for i in range(hidden_size)]
+
+    fig, axes = plt.subplots(
+        1, 2,
+        figsize=(max(8, vocab_size * 0.5 + hidden_size * 0.5), max(3.5, hidden_size * 0.55)),
+        constrained_layout=True,
+    )
+
+    axes[0].imshow(
+        W_in, aspect="auto", cmap="RdBu_r", vmin=-vmax, vmax=vmax,
+        interpolation="nearest", origin="lower",
+    )
+    axes[0].set_xticks(range(vocab_size))
+    axes[0].set_xticklabels(char_axis_labels(chars), fontsize=8)
+    axes[0].set_yticks(range(hidden_size))
+    axes[0].set_yticklabels(unit_labels)
+    axes[0].set_xlabel("input character")
+    axes[0].set_ylabel("hidden unit")
+    axes[0].set_title("Input → hidden (Wxh)")
+
+    im1 = axes[1].imshow(
+        W_rec, aspect="equal", cmap="RdBu_r", vmin=-vmax, vmax=vmax,
+        interpolation="nearest", origin="lower",
+    )
+    axes[1].set_xticks(range(hidden_size))
+    axes[1].set_xticklabels(unit_labels, fontsize=7, rotation=90)
+    axes[1].set_yticks(range(hidden_size))
+    axes[1].set_yticklabels(unit_labels)
+    axes[1].set_xlabel("source h (t−1)")
+    axes[1].set_ylabel("target h (t)")
+    axes[1].set_title("Hidden → hidden (Whh)")
+
+    fig.colorbar(im1, ax=axes, fraction=0.03, pad=0.02, label="weight")
+    fig.suptitle("Learned weights (final model)", y=1.02)
+    save_path = os.path.join(out_dir, "weights.png")
+    fig.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"wrote {save_path}")
 
@@ -382,8 +622,8 @@ def main() -> None:
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--model", default="model.npz")
     parser.add_argument("--input", default="input.txt")
-    parser.add_argument("--length", type=int, default=200,
-                        help="how many characters of the corpus to visualize (default: 200)")
+    parser.add_argument("--length", type=int, default=50,
+                        help="how many characters of the corpus to visualize (default: 50)")
     parser.add_argument("--out-dir", default="plots")
     parser.add_argument("--no-cluster-per-char", action="store_true",
                         help="keep per-character heatmap rows in sequence order")
@@ -394,6 +634,12 @@ def main() -> None:
     model = load_model(args.model)
     print(f"loaded model: hidden_size={model['hidden_size']}, "
           f"vocab_size={model['vocab_size']}, chars={''.join(model['chars'])}")
+
+    plot_learned_weights(model, args.out_dir)
+    plot_learning_curve(
+        model,
+        save_path=os.path.join(args.out_dir, "learning_curve.png"),
+    )
 
     with open(args.input, "r") as f:
         text = f.read()[: args.length]
@@ -421,6 +667,16 @@ def main() -> None:
     plot_pca_context_labels(
         text, hidden_states, model["chars"],
         save_path=os.path.join(args.out_dir, "hidden_states_pca_context_labels.png"),
+    )
+
+    plot_mds_context_labels(
+        text, hidden_states, model["chars"],
+        save_path=os.path.join(args.out_dir, "hidden_states_mds_context_labels.png"),
+    )
+
+    plot_hidden_states_clustermap(
+        text, hidden_states,
+        save_path=os.path.join(args.out_dir, "hidden_states_clustermap.png"),
     )
 
     if model["hidden_size"] == 2:

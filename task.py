@@ -8,7 +8,7 @@ consumed by `min-char-rnn.py` unchanged.
 From: https://github.com/Raneem-mahajne/creating_transformer/tree/statistical_learning
 
 Usage:
-    python task.py                       # default: shared_letters, 100k chars
+    python task.py                       # default: shared_letters, 50 chars
     python task.py shared_letters
     python task.py disjoint_letters --chars 200000
     python task.py one_word
@@ -39,8 +39,8 @@ def main() -> None:
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("regime", nargs="?", default="shared_letters",
                         choices=list(REGIMES.keys()))
-    parser.add_argument("--chars", type=int, default=100_000,
-                        help="total characters to emit (default: 100000)")
+    parser.add_argument("--chars", type=int, default=50,
+                        help="total characters to emit (default: 50)")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--out", default="input.txt")
     args = parser.parse_args()
